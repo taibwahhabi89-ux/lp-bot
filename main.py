@@ -2,115 +2,172 @@ import os
 import time
 import requests
 
-TOKEN = os.getenv("BOT_TOKEN")
+BOT_TOKEN = os.getenv("BOT_TOKEN")
 CHAT_ID = os.getenv("CHAT_ID")
 
-LAST_VOLUMES = {}
+CHECK_INTERVAL = 180
+COOLDOWN = 60 * 60
+
+QUERIES = [
+    "WETH", "ETH", "USDC", "USDT", "WBTC", "BTC",
+    "AAVE", "LINK", "UNI", "LDO", "ARB", "OP",
+    "wstETH", "rETH", "weETH", "cbETH", "USDe", "sUSDe"
+]
+
+CHAINS = {"ethereum", "base", "arbitrum"}
 LAST_ALERTS = {}
-COOLDOWN_SECONDS = 900  # 15 min cooldown
 
 def send(msg):
     try:
         requests.post(
-            f"https://api.telegram.org/bot{TOKEN}/sendMessage",
-            json={"chat_id": CHAT_ID, "text": msg}
+            f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
+            json={"chat_id": CHAT_ID, "text": msg},
+            timeout=15
         )
-    except:
-        pass
+    except Exception as e:
+        print("Telegram error:", e)
 
-def score_pair(p):
-    score = 0
-    reasons = []
+def safe_get_json(url):
+    try:
+        r = requests.get(url, timeout=20)
+        if r.status_code != 200:
+            print("Bad status:", r.status_code, url)
+            return {}
+        return r.json()
+    except Exception as e:
+        print("Fetch/json error:", e, url)
+        return {}
 
-    volume = p.get("volume", {}).get("h24", 0)
-    liquidity = p.get("liquidity", {}).get("usd", 0)
-    txns = p.get("txns", {}).get("h24", {}).get("buys", 0)
+def fetch_pairs(query):
+    url = f"https://api.dexscreener.com/latest/dex/search?q={query}"
+    data = safe_get_json(url)
+    return data.get("pairs") or []
 
-    if volume > 100000:
-        score += 1
-        reasons.append("volume")
+def good_pair(p):
+    dex = (p.get("dexId") or "").lower()
+    chain = p.get("chainId")
 
-    if liquidity > 50000:
-        score += 1
-        reasons.append("liquidity")
+    if "uniswap" not in dex:
+        return False
 
-    if txns > 100:
-        score += 1
-        reasons.append("activity")
+    if chain not in CHAINS:
+        return False
 
-    return score, reasons
+    liquidity = float((p.get("liquidity") or {}).get("usd") or 0)
+    volume24 = float((p.get("volume") or {}).get("h24") or 0)
+    volume1h = float((p.get("volume") or {}).get("h1") or 0)
+
+    txns = p.get("txns") or {}
+    h24 = txns.get("h24") or {}
+    buys = int(h24.get("buys") or 0)
+    sells = int(h24.get("sells") or 0)
+    total_txns = buys + sells
+
+    makers = int(((p.get("makers") or {}).get("h24")) or 0)
+
+    if liquidity < 300_000:
+        return False
+
+    if liquidity > 50_000_000:
+        return False
+
+    if volume24 < 500_000:
+        return False
+
+    if volume1h < 50_000:
+        return False
+
+    if volume24 / liquidity < 0.25:
+        return False
+
+    if total_txns < 250:
+        return False
+
+    if makers < 50:
+        return False
+
+    if buys == 0 or sells == 0:
+        return False
+
+    balance = min(buys, sells) / max(buys, sells)
+    if balance < 0.25:
+        return False
+
+    return True
 
 def scan():
-    url = "https://api.dexscreener.com/latest/dex/pairs/ethereum"
-    data = requests.get(url).json()
-
     found = {}
 
-    for pair in data["pairs"]:
-        pair_id = pair["pairAddress"]
-        found[pair_id] = pair
+    for q in QUERIES:
+        pairs = fetch_pairs(q)
+        for p in pairs:
+            pair_id = p.get("pairAddress")
+            if pair_id:
+                found[pair_id] = p
 
     for pair_id, p in found.items():
         try:
-            score, reason = score_pair(p)
-
-            # 🔥 EARLY + MOMENTUM
-            pair_created = p.get("pairCreatedAt", 0)
-            age_minutes = (time.time() - pair_created/1000) / 60 if pair_created else 99999
-
-            if age_minutes < 120:
-                score += 2
-
-            if age_minutes < 30:
-                score += 3
-
-            if score < 5:
+            if not good_pair(p):
                 continue
-
-            volume = p["volume"]["h24"]
-            liquidity = p["liquidity"]["usd"]
-
-            # 🔥 FILTERS (no garbage)
-            if liquidity < 30000:
-                continue
-
-            base = p["baseToken"]["symbol"]
-            quote = p["quoteToken"]["symbol"]
-
-            if quote not in ["USDC", "USDT", "WETH"]:
-                continue
-
-            old_volume = LAST_VOLUMES.get(pair_id, volume)
-            change = volume - old_volume
 
             now = time.time()
-            if pair_id in LAST_ALERTS and now - LAST_ALERTS[pair_id] < COOLDOWN_SECONDS:
+            if pair_id in LAST_ALERTS and now - LAST_ALERTS[pair_id] < COOLDOWN:
                 continue
 
-            # 🔥 SPIKE DETECTIE
-            if change > 50000 and volume > 100000:
-                msg = f"""
-🚀 VOLUME SPIKE
+            base = (p.get("baseToken") or {}).get("symbol", "?")
+            quote = (p.get("quoteToken") or {}).get("symbol", "?")
+            chain = p.get("chainId", "?")
+            dex = p.get("dexId", "?")
 
-{base}/{quote}
+            liquidity = float((p.get("liquidity") or {}).get("usd") or 0)
+            volume24 = float((p.get("volume") or {}).get("h24") or 0)
+            volume1h = float((p.get("volume") or {}).get("h1") or 0)
+            vol_tvl = volume24 / liquidity if liquidity else 0
+
+            h24 = (p.get("txns") or {}).get("h24") or {}
+            buys = int(h24.get("buys") or 0)
+            sells = int(h24.get("sells") or 0)
+            total_txns = buys + sells
+
+            makers = int(((p.get("makers") or {}).get("h24")) or 0)
+
+            dex_url = p.get("url") or f"https://dexscreener.com/{chain}/{pair_id}"
+            uni_url = f"https://app.uniswap.org/explore/pools/{chain}/{pair_id}"
+
+            msg = f"""
+🚨 LP KANDIDAAT
+
+Pool: {base}/{quote}
+Chain: {chain}
+DEX: {dex}
 
 💧 Liquidity: ${liquidity:,.0f}
-📊 Volume: ${volume:,.0f}
-📈 Spike: +${change:,.0f}
+📊 24h Volume: ${volume24:,.0f}
+⚡ 1h Volume: ${volume1h:,.0f}
+📈 Vol/TVL: {vol_tvl:.2f}
 
-https://dexscreener.com/ethereum/{pair_id}
+🔁 TXNS 24h: {total_txns}
+🟢 Buys: {buys}
+🔴 Sells: {sells}
+👥 Makers: {makers}
+
+Dexscreener:
+{dex_url}
+
+Uniswap:
+{uni_url}
+
+VFAT:
+https://vfat.io/
 """
+            send(msg)
+            LAST_ALERTS[pair_id] = now
 
-                send(msg)
-                LAST_ALERTS[pair_id] = now
+        except Exception as e:
+            print("Pair error:", e)
 
-            LAST_VOLUMES[pair_id] = volume
-
-        except:
-            continue
-
-send("🔥 LP scanner volledig gestart!!")
+send("✅ LP scanner stabiel gestart")
 
 while True:
     scan()
-    time.sleep(60)
+    time.sleep(CHECK_INTERVAL)
