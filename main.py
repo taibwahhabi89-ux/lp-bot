@@ -1,202 +1,116 @@
-import os, time, requests
+import os
+import time
+import requests
 
-BOT_TOKEN = os.getenv("BOT_TOKEN")
+TOKEN = os.getenv("BOT_TOKEN")
 CHAT_ID = os.getenv("CHAT_ID")
 
-CHECK_INTERVAL = int(os.getenv("CHECK_INTERVAL", "180"))
-COOLDOWN_SECONDS = int(os.getenv("COOLDOWN_SECONDS", "21600"))
-
-MIN_LIQUIDITY = float(os.getenv("MIN_LIQUIDITY", "300000"))
-MAX_LIQUIDITY = float(os.getenv("MAX_LIQUIDITY", "50000000"))
-MIN_VOLUME_24H = float(os.getenv("MIN_VOLUME_24H", "500000"))
-MIN_VOL_TVL = float(os.getenv("MIN_VOL_TVL", "0.25"))
-MIN_TXNS_24H = int(os.getenv("MIN_TXNS_24H", "300"))
-MIN_MAKERS = int(os.getenv("MIN_MAKERS", "80"))
-MIN_SPIKE_1H = float(os.getenv("MIN_SPIKE_1H", "100000"))
-
-CHAINS = {"ethereum", "base", "arbitrum"}
-QUERIES = [
-    "WETH", "ETH", "USDC", "USDT", "WBTC", "BTC",
-    "LINK", "AAVE", "UNI", "LDO", "ARB", "OP",
-    "weETH", "wstETH", "rETH", "cbETH", "ezETH",
-    "sUSDe", "USDe", "DAI", "FRAX"
-]
-
-BAD_WORDS = [
-    "elon", "musk", "inu", "pepe", "dog", "cat", "shib",
-    "chad", "moon", "pump", "safe", "baby", "flork",
-    "asteroid", "casino", "presale"
-]
-
-last_volumes = {}
-last_alerts = {}
+LAST_VOLUMES = {}
+LAST_ALERTS = {}
+COOLDOWN_SECONDS = 900  # 15 min cooldown
 
 def send(msg):
-    requests.post(
-        f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
-        json={"chat_id": CHAT_ID, "text": msg},
-        timeout=15
-    )
-
-def fetch(query):
-    url = f"https://api.dexscreener.com/latest/dex/search?q={query}"
-    r = requests.get(url, timeout=20)
-    r.raise_for_status()
-    return r.json().get("pairs", [])
-
-def bad_name(base, quote):
-    name = f"{base} {quote}".lower()
-    return any(w in name for w in BAD_WORDS)
+    try:
+        requests.post(
+            f"https://api.telegram.org/bot{TOKEN}/sendMessage",
+            json={"chat_id": CHAT_ID, "text": msg}
+        )
+    except:
+        pass
 
 def score_pair(p):
     score = 0
+    reasons = []
 
-    chain = p.get("chainId", "")
-    dex = p.get("dexId", "")
-    base = p.get("baseToken", {}).get("symbol", "")
-    quote = p.get("quoteToken", {}).get("symbol", "")
+    volume = p.get("volume", {}).get("h24", 0)
+    liquidity = p.get("liquidity", {}).get("usd", 0)
+    txns = p.get("txns", {}).get("h24", {}).get("buys", 0)
 
-    if chain not in CHAINS:
-        return -999, "wrong chain"
-
-    if "uniswap" not in dex.lower():
-        return -999, "not uniswap"
-
-    if bad_name(base, quote):
-        return -999, "meme/garbage name"
-
-    liquidity = float(p.get("liquidity", {}).get("usd") or 0)
-    volume24 = float(p.get("volume", {}).get("h24") or 0)
-    volume1h = float(p.get("volume", {}).get("h1") or 0)
-
-    txns = p.get("txns", {}).get("h24", {})
-    buys = int(txns.get("buys") or 0)
-    sells = int(txns.get("sells") or 0)
-    total_txns = buys + sells
-
-    makers = int(p.get("makers", {}).get("h24") or 0)
-
-    price_change = p.get("priceChange", {})
-    change_24h = float(price_change.get("h24") or 0)
-
-    if liquidity < MIN_LIQUIDITY:
-        return -999, "liquidity too low"
-
-    if liquidity > MAX_LIQUIDITY:
-        return -999, "liquidity too high"
-
-    if volume24 < MIN_VOLUME_24H:
-        return -999, "volume too low"
-
-    vol_tvl = volume24 / liquidity if liquidity else 0
-
-    if vol_tvl < MIN_VOL_TVL:
-        return -999, "vol/tvl too low"
-
-    if total_txns < MIN_TXNS_24H:
-        return -999, "not enough txns"
-
-    if makers < MIN_MAKERS:
-        return -999, "not enough makers"
-
-    if abs(change_24h) > 300:
-        return -999, "too pumpy"
-
-    if vol_tvl >= 0.25:
+    if volume > 100000:
         score += 1
-    if vol_tvl >= 0.5:
-        score += 2
-    if volume1h >= MIN_SPIKE_1H:
-        score += 2
-    if total_txns >= 500:
-        score += 1
-    if makers >= 150:
-        score += 1
-    if buys > 0 and sells > 0:
-        balance = min(buys, sells) / max(buys, sells)
-        if balance > 0.35:
-            score += 1
+        reasons.append("volume")
 
-    return score, "ok"
+    if liquidity > 50000:
+        score += 1
+        reasons.append("liquidity")
+
+    if txns > 100:
+        score += 1
+        reasons.append("activity")
+
+    return score, reasons
 
 def scan():
+    url = "https://api.dexscreener.com/latest/dex/pairs/ethereum"
+    data = requests.get(url).json()
+
     found = {}
 
-    for q in QUERIES:
-        try:
-            for p in fetch(q):
-                pair_id = p.get("pairAddress")
-                if pair_id:
-                    found[pair_id] = p
-        except Exception:
-            continue
+    for pair in data["pairs"]:
+        pair_id = pair["pairAddress"]
+        found[pair_id] = pair
 
     for pair_id, p in found.items():
         try:
             score, reason = score_pair(p)
+
+            # 🔥 EARLY + MOMENTUM
+            pair_created = p.get("pairCreatedAt", 0)
+            age_minutes = (time.time() - pair_created/1000) / 60 if pair_created else 99999
+
+            if age_minutes < 120:
+                score += 2
+
+            if age_minutes < 30:
+                score += 3
+
             if score < 5:
                 continue
 
-            now = time.time()
-            if pair_id in last_alerts and now - last_alerts[pair_id] < COOLDOWN_SECONDS:
+            volume = p["volume"]["h24"]
+            liquidity = p["liquidity"]["usd"]
+
+            # 🔥 FILTERS (no garbage)
+            if liquidity < 30000:
                 continue
 
-            chain = p.get("chainId", "")
-            dex = p.get("dexId", "")
-            base = p.get("baseToken", {}).get("symbol", "")
-            quote = p.get("quoteToken", {}).get("symbol", "")
+            base = p["baseToken"]["symbol"]
+            quote = p["quoteToken"]["symbol"]
 
-            liquidity = float(p.get("liquidity", {}).get("usd") or 0)
-            volume24 = float(p.get("volume", {}).get("h24") or 0)
-            volume1h = float(p.get("volume", {}).get("h1") or 0)
-            vol_tvl = volume24 / liquidity if liquidity else 0
+            if quote not in ["USDC", "USDT", "WETH"]:
+                continue
 
-            txns = p.get("txns", {}).get("h24", {})
-            buys = int(txns.get("buys") or 0)
-            sells = int(txns.get("sells") or 0)
-            total_txns = buys + sells
+            old_volume = LAST_VOLUMES.get(pair_id, volume)
+            change = volume - old_volume
 
-            makers = int(p.get("makers", {}).get("h24") or 0)
+            now = time.time()
+            if pair_id in LAST_ALERTS and now - LAST_ALERTS[pair_id] < COOLDOWN_SECONDS:
+                continue
 
-            dex_link = p.get("url")
-            uni_link = f"https://app.uniswap.org/explore/pools/{chain}/{pair_id}"
-            vfat_link = "https://vfat.io/"
+            # 🔥 SPIKE DETECTIE
+            if change > 50000 and volume > 100000:
+                msg = f"""
+🚀 VOLUME SPIKE
 
-            msg = f"""
-🚨 LP KANDIDAAT GEVONDEN
-
-Pool: {base}/{quote}
-Chain: {chain}
-DEX: {dex}
-Score: {score}/8
+{base}/{quote}
 
 💧 Liquidity: ${liquidity:,.0f}
-📊 24h Volume: ${volume24:,.0f}
-⚡ 1h Volume: ${volume1h:,.0f}
-📈 Vol/TVL: {vol_tvl:.2f}
+📊 Volume: ${volume:,.0f}
+📈 Spike: +${change:,.0f}
 
-🔁 TXNS 24h: {total_txns}
-🟢 Buys: {buys}
-🔴 Sells: {sells}
-👥 Makers: {makers}
-
-Dexscreener:
-{dex_link}
-
-Uniswap:
-{uni_link}
-
-VFAT:
-{vfat_link}
+https://dexscreener.com/ethereum/{pair_id}
 """
-            send(msg)
-            last_alerts[pair_id] = now
 
-        except Exception:
+                send(msg)
+                LAST_ALERTS[pair_id] = now
+
+            LAST_VOLUMES[pair_id] = volume
+
+        except:
             continue
 
-send("🔥 LP scanner volledig gestart")
+send("🔥 LP scanner volledig gestart!!")
 
 while True:
     scan()
-    time.sleep(CHECK_INTERVAL)
+    time.sleep(60)
