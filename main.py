@@ -50,7 +50,7 @@ def good_pair(p):
     if "uniswap" not in dex:
         return False
 
-    if chain not in CHAINS:
+    if chain not in ["ethereum", "base", "arbitrum"]:
         return False
 
     liquidity = float((p.get("liquidity") or {}).get("usd") or 0)
@@ -63,34 +63,25 @@ def good_pair(p):
     sells = int(h24.get("sells") or 0)
     total_txns = buys + sells
 
-    makers = int(((p.get("makers") or {}).get("h24")) or 0)
-
-    if liquidity < 300_000:
-        return False
-
-    if liquidity > 50_000_000:
-        return False
-
-    if volume24 < 500_000:
-        return False
-
-    if volume1h < 50_000:
-        return False
-
-    if volume24 / liquidity < 0.25:
-        return False
-
-    if total_txns < 250:
-        return False
-
-    if makers < 50:
-        return False
-
+    # 🔥 NIEUWE BALANS FILTER (belangrijk)
     if buys == 0 or sells == 0:
         return False
 
     balance = min(buys, sells) / max(buys, sells)
-    if balance < 0.25:
+    if balance < 0.2:
+        return False
+
+    # 🔥 MINDER STRENG DAN VOORHEEN
+    if liquidity < 100_000:
+        return False
+
+    if volume24 < 200_000:
+        return False
+
+    if volume1h < 20_000:
+        return False
+
+    if total_txns < 80:
         return False
 
     return True
